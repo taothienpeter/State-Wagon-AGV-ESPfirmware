@@ -1,0 +1,14 @@
+{
+  "servers": {
+    "esp-idf-eim": {
+      "command": "C:\\Program Files\\eim\\eim.exe",
+      "args": [
+        "run",
+        "idf.py mcp-server"
+      ],
+      "env": {
+        "IDF_MCP_WORKSPACE_FOLDER": "${workspaceFolder}"
+      }
+    }
+  }
+}

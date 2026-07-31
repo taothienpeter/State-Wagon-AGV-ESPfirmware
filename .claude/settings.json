@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/tao/Desktop/Workspace/my projects/AGV/**)"
+    ]
+  }
+}
