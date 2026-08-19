@@ -29,6 +29,10 @@ extern "C" {
 #define STM_CMD_RATE_HZ             50
 #define STM_FB_TIMEOUT_MS           300
 
+/* ---- Sensor Enable Flags ---- */
+#define AGV_ENABLE_IMU              1   /* 1 = BNO055 active (Yaw/Heading source) */
+#define AGV_ENABLE_UWB              0   /* 0 = UWB disabled/bypassed */
+
 /* ---- IMU (BNO055 via I2C) ---- */
 #define IMU_I2C_NUM                 I2C_NUM_0
 #define IMU_I2C_SDA_PIN             GPIO_NUM_21
@@ -37,7 +41,7 @@ extern "C" {
 #define IMU_I2C_ADDR                0x28
 #define IMU_SAMPLE_RATE_HZ          100
 
-/* ---- UWB (DWM1000 via SPI) ---- */
+/* ---- UWB (DWM1000 via SPI - disabled when AGV_ENABLE_UWB=0) ---- */
 #define UWB_SPI_HOST                SPI2_HOST
 #define UWB_SPI_MOSI                GPIO_NUM_23
 #define UWB_SPI_MISO                GPIO_NUM_19
@@ -46,7 +50,7 @@ extern "C" {
 #define UWB_SPI_IRQ                 GPIO_NUM_4
 #define UWB_SPI_CLOCK_HZ           20000000
 #define UWB_RATE_HZ                 10
-#define UWB_ANCHOR_COUNT            4
+#define UWB_ANCHOR_COUNT            0
 
 /* ---- Vehicle geometry ---- */
 #define AGV_WHEELBASE_M             0.42f

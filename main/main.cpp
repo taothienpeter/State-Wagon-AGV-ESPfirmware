@@ -108,7 +108,7 @@ static void plannerTaskFunc(void* arg) {
         /* 2. EKF predict (wheel odometry + dynamic dt_s) */
         g_ekf.predict(delta_x, delta_y, delta_theta, dt_s);
 
-        /* 3. EKF update from IMU heading */
+        /* 3. EKF update from IMU heading (Primary orientation source) */
         portENTER_CRITICAL(&ekf_mux);
         bool imu_updated = g_imu_updated;
         float imu_heading = g_imu_heading;
@@ -119,7 +119,8 @@ static void plannerTaskFunc(void* arg) {
             g_ekf.updateIMU(imu_heading);
         }
 
-        /* 4. EKF update from UWB */
+#if AGV_ENABLE_UWB
+        /* 4. EKF update from UWB (if enabled) */
         portENTER_CRITICAL(&ekf_mux);
         bool uwb_updated = g_uwb_updated;
         float uwb_x = g_uwb_x, uwb_y = g_uwb_y;
@@ -129,6 +130,7 @@ static void plannerTaskFunc(void* arg) {
         if (uwb_updated) {
             g_ekf.updateUWB(uwb_x, uwb_y, g_ekf.x_nom[2]);
         }
+#endif
 
         /* 5. Publish EKF pose + velocity to shared globals */
         portENTER_CRITICAL(&ekf_mux);
@@ -213,6 +215,7 @@ static void imuTaskFunc(void* arg) {
     }
 }
 
+#if AGV_ENABLE_UWB
 /* ---- UWB ranging task (core 0, 10 Hz) ---- */
 static void uwbTaskFunc(void* arg) {
     (void)arg;
@@ -256,6 +259,7 @@ static void uwbTaskFunc(void* arg) {
         }
     }
 }
+#endif
 
 /* ---- State publish task (core 0, 8 Hz) ---- */
 static void statePublishTaskFunc(void* arg) {
@@ -276,7 +280,9 @@ static void statePublishTaskFunc(void* arg) {
         float px = g_pose_x, py = g_pose_y, pt = g_pose_theta;
         float vx = g_pose_vx, omega = g_pose_omega;
         float imu_h = g_imu_heading;
+#if AGV_ENABLE_UWB
         float uwb_x = g_uwb_x, uwb_y = g_uwb_y;
+#endif
         portEXIT_CRITICAL(&ekf_mux);
 
         /* Read STM32 feedback for drive controller status */
@@ -341,10 +347,17 @@ static void statePublishTaskFunc(void* arg) {
         imu_obj["calibration_status"] = 3; /* placeholder — read full cal status */
 
         JsonObject uwb_obj = doc.createNestedObject("uwb");
+#if AGV_ENABLE_UWB
         uwb_obj["anchors"] = UWB_ANCHOR_COUNT;
         uwb_obj["quality"] = 0.0f;
         uwb_obj["x"] = uwb_x;
         uwb_obj["y"] = uwb_y;
+#else
+        uwb_obj["anchors"] = 0;
+        uwb_obj["quality"] = 0.0f;
+        uwb_obj["x"] = px;
+        uwb_obj["y"] = py;
+#endif
 
         JsonArray controllers = doc.createNestedArray("driveControllers");
         JsonObject ctrl = controllers.createNestedObject();
@@ -561,8 +574,12 @@ extern "C" void app_main(void) {
     /* IMU sensor: core 0, priority 8, 100 Hz */
     xTaskCreatePinnedToCore(&imuTaskFunc, "imu_sensor", 4096, NULL, 8, NULL, 0);
 
+#if AGV_ENABLE_UWB
     /* UWB ranging: core 0, priority 5, 10 Hz */
     xTaskCreatePinnedToCore(&uwbTaskFunc, "uwb_ranging", 4096, NULL, 5, NULL, 0);
+#else
+    ESP_LOGI(TAG, "UWB disabled — Localization running in IMU Yaw + Wheel Odometry mode");
+#endif
 
     /* State publish: core 0, priority 5, 8 Hz */
     xTaskCreatePinnedToCore(&statePublishTaskFunc, "state_pub", 6144, NULL, 5, NULL, 0);

@@ -29,8 +29,8 @@ are specified as they exist in the codebase.
 │  - Receives orders from server (flat waypoint list)   │
 │  - Trajectory generation (trapezoidal profiles)       │
 │  - Swerve kinematics (body velocity → wheel commands) │
-│  - Sensor fusion (wheel odometry + IMU heading +      │
-│    UWB position → ES_EKF)                             │
+│  - Sensor fusion (wheel odometry + BNO055 IMU heading │
+│    → ES_EKF; UWB optional/disabled by default)        │
 │  - Publishes state to server at 8 Hz                  │
 │  - Sends MOTION_CMD to STM32 at 50 Hz                 │
 └────────────────┬────────────────────────────────────┘
