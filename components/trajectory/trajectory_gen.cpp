@@ -70,6 +70,8 @@ float TrajectoryGen::computeProfileSpeed(float dist_remaining, float max_speed,
     } else if (current_speed < max_speed) {
         /* ACCELERATE */
         float speed = current_speed + profile_.max_accel_mps2 * dt_s;
+        if (speed < 0.0f)
+            speed = 0.0f;
         return (speed > max_speed) ? max_speed : speed;
     } else {
         /* CRUISE */
@@ -124,7 +126,7 @@ BodyVelocity TrajectoryGen::tick(const float pose[3], float dt_s) {
             return result;
         }
         /* Start next segment immediately on same tick */
-        return tick(pose, dt_s);
+        return tick(pose, 0.0f);
     }
 
     /* ---- Build BodyVelocity ---- */

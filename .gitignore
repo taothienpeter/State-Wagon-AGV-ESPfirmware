@@ -81,3 +81,6 @@ skills-lock.json
 *.workspace # General workspace files, can be from various tools
 *.suo       # Visual Studio Solution User Options
 *.sln.docstates # Visual Studio
+kilo.json
+kilo.jsonc
+.kilo/

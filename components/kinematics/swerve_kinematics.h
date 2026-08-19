@@ -29,7 +29,7 @@ struct BodyVelocity {
 
 class SwerveKinematics {
 public:
-    SwerveKinematics() {}
+    SwerveKinematics() : SwerveKinematics(VehicleGeometry{}) {}
     explicit SwerveKinematics(const VehicleGeometry& geom) : geom_(geom) {
         prev_cmd_[0] = prev_cmd_[1] = {0, 0, 0};
         last_cmd_dt_ = 0.01f;
@@ -66,8 +66,8 @@ public:
                 angle = atan2f(v_i_y, vx);
                 speed = sqrtf(vx * vx + v_i_y * v_i_y);
             } else {
-                /* Pure rotation: wheels turn 90° to rotate in place */
-                angle = (omega > 0) ? (float)M_PI_2 : -(float)M_PI_2;
+                /* Pure rotation: wheels turn 90° opposite ways to rotate in place */
+                angle = (omega * x_i > 0.0f) ? (float)M_PI_2 : -(float)M_PI_2;
                 speed = fabsf(v_i_y);
             }
 
