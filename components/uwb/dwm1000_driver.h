@@ -22,7 +22,8 @@
 
 class Dwm1000Driver {
 public:
-    Dwm1000Driver(spi_host_device_t host, int cs, int irq, int rst = -1);
+    Dwm1000Driver(spi_host_device_t host, int cs, int irq, int rst = -1,
+                  int mosi = 23, int miso = 19, int sclk = 18);
 
     /* Init SPI bus, configure DW1000 channel */
     bool begin();
@@ -50,6 +51,7 @@ private:
     spi_host_device_t host_;
     spi_device_handle_t spi_;
     int cs_, irq_, rst_;
+    int mosi_, miso_, sclk_;
     float anchors_[MAX_ANCHORS][3];
     int anchor_count_;
     bool initialized_;

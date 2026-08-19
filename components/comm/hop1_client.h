@@ -4,6 +4,9 @@
 #include <stdint.h>
 #include <functional>
 #include <string>
+#include <ArduinoJson.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #ifdef __cplusplus
 
@@ -19,7 +22,8 @@ enum class Hop1State {
 
 class Hop1Client {
 public:
-    Hop1Client(const char* vehicle_id, const char* host, uint16_t port);
+    Hop1Client(const char* vehicle_id, const char* host, uint16_t port, float max_speed_mps = 1.2f);
+    ~Hop1Client();
 
     /* Start the client task (pinned to core). Returns immediately. */
     void begin();
@@ -27,6 +31,9 @@ public:
     /* Register callbacks for incoming messages */
     void onOrder(OrderCallback cb) { order_cb_ = cb; }
     void onInstantAction(ActionCallback cb) { action_cb_ = cb; }
+
+    /* Send order acknowledgment (ACCEPTED / REJECTED) */
+    void sendAck(const char* order_id, const char* status, const char* reason = nullptr);
 
     /* Publish state payload to server (wraps in envelope, thread-safe) */
     void publishState(const char* state_payload_json);
@@ -47,16 +54,21 @@ private:
     char vehicle_id_[32];
     char host_[64];
     uint16_t port_;
+    float max_speed_mps_;
     Hop1State state_;
     int sock_;
 
     OrderCallback order_cb_;
     ActionCallback action_cb_;
 
-    /* Stored JSON for publishing (locked by publish mutex) */
-    char pending_json_[2048];
-    bool has_pending_;
+    SemaphoreHandle_t send_mux_;
+
+    /* 16 KB persistent buffers for large order reception and zero-malloc parsing */
+    uint8_t recv_buf_[16384];
+    StaticJsonDocument<16384> incoming_doc_;
+    char wps_scratch_[16384];
 };
 
 #endif /* __cplusplus */
 #endif /* HOP1_CLIENT_H */
+

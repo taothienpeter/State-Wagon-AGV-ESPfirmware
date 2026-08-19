@@ -5,6 +5,11 @@
 #include <vector>
 #include "swerve_kinematics.h"
 
+#if defined(ESP_PLATFORM)
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#endif
+
 #ifdef __cplusplus
 
 struct Waypoint {
@@ -30,6 +35,7 @@ enum class TrajStatus : uint8_t {
 class TrajectoryGen {
 public:
     explicit TrajectoryGen(const MotionProfile& profile = MotionProfile{});
+    ~TrajectoryGen();
 
     /* Load flat waypoint list from server order */
     void loadWaypoints(const std::vector<Waypoint>& wps);
@@ -49,11 +55,15 @@ public:
     BodyVelocity tick(const float pose[3], float dt_s);
 
     /* State accessors */
-    TrajStatus status() const { return status_; }
-    float currentSpeedMps() const { return current_speed_mps_; }
-    int activeIndex() const { return active_index_; }
+    TrajStatus status() const;
+    const char* orderStateString() const;
+    float currentSpeedMps() const;
+    int activeIndex() const;
 
 private:
+    void lock() const;
+    void unlock() const;
+
     /* Compute trapezoidal speed profile */
     float computeProfileSpeed(float dist_remaining, float max_speed,
                                float current_speed, float dt_s);
@@ -65,7 +75,12 @@ private:
     bool estop_;
     TrajStatus status_;
     MotionProfile profile_;
+
+#if defined(ESP_PLATFORM)
+    SemaphoreHandle_t mux_;
+#endif
 };
 
 #endif /* __cplusplus */
 #endif /* TRAJECTORY_GEN_H */
+

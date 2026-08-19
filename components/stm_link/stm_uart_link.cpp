@@ -29,7 +29,12 @@ void StmUartLink::begin(uart_port_t uart_num, int tx_pin, int rx_pin,
 
     ESP_ERROR_CHECK(uart_param_config(uart_num_, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(uart_num_, tx_pin, rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    ESP_ERROR_CHECK(uart_driver_install(uart_num_, 1024, 1024, 10, &safety_evt_queue_, 0));
+    ESP_ERROR_CHECK(uart_driver_install(uart_num_, 1024, 1024, 0, NULL, 0));
+
+    /* Create dedicated queue for safety events */
+    if (!safety_evt_queue_) {
+        safety_evt_queue_ = xQueueCreate(10, sizeof(safety_event_t));
+    }
 
     initialized_ = true;
 

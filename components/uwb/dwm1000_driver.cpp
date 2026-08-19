@@ -13,8 +13,10 @@ static const char* TAG = "DWM1000";
 #define DW_SPI_WRITE(reg)  ((uint16_t)((reg) & 0x3F) << 8)  /* 7-bit sub + extended flag */
 #define DW_SPI_READ(reg)   ((uint16_t)(((reg) & 0x3F) << 8) | 0x80)
 
-Dwm1000Driver::Dwm1000Driver(spi_host_device_t host, int cs, int irq, int rst)
+Dwm1000Driver::Dwm1000Driver(spi_host_device_t host, int cs, int irq, int rst,
+                             int mosi, int miso, int sclk)
     : host_(host), cs_(cs), irq_(irq), rst_(rst),
+      mosi_(mosi), miso_(miso), sclk_(sclk),
       anchor_count_(0), initialized_(false)
 {
     memset(anchors_, 0, sizeof(anchors_));
@@ -22,14 +24,28 @@ Dwm1000Driver::Dwm1000Driver(spi_host_device_t host, int cs, int irq, int rst)
 
 bool Dwm1000Driver::spiWrite(uint16_t reg, const uint8_t* data, size_t len) {
     /* DW1000 SPI: first byte = (reg & 0x7F) << 1 | 0, extended addressing uses 2-byte header */
-    /* Simplified: use single-byte header for registers < 0x40 */
     uint8_t header = (reg & 0x3F) << 1; /* write, no extended */
     spi_transaction_t t = {};
-    t.flags = SPI_TRANS_USE_TXDATA;
-    t.length = (8 + len * 8);
-    t.tx_data[0] = header;
-    memcpy(&t.tx_data[1], data, len);
-    return spi_device_polling_transmit(spi_, &t) == ESP_OK;
+
+    if (len <= 3) {
+        t.flags = SPI_TRANS_USE_TXDATA;
+        t.length = (8 + len * 8);
+        t.tx_data[0] = header;
+        if (data && len > 0) {
+            memcpy(&t.tx_data[1], data, len);
+        }
+        return spi_device_polling_transmit(spi_, &t) == ESP_OK;
+    } else {
+        uint8_t tx_buf[136];
+        if (len > sizeof(tx_buf) - 1) len = sizeof(tx_buf) - 1;
+        tx_buf[0] = header;
+        if (data && len > 0) {
+            memcpy(&tx_buf[1], data, len);
+        }
+        t.length = (8 + len * 8);
+        t.tx_buffer = tx_buf;
+        return spi_device_polling_transmit(spi_, &t) == ESP_OK;
+    }
 }
 
 bool Dwm1000Driver::spiRead(uint16_t reg, uint8_t* data, size_t len) {
@@ -46,9 +62,9 @@ bool Dwm1000Driver::spiRead(uint16_t reg, uint8_t* data, size_t len) {
 bool Dwm1000Driver::begin() {
     /* Configure SPI bus */
     spi_bus_config_t buscfg = {};
-    buscfg.mosi_io_num = 23;
-    buscfg.miso_io_num = 19;
-    buscfg.sclk_io_num = 18;
+    buscfg.mosi_io_num = mosi_;
+    buscfg.miso_io_num = miso_;
+    buscfg.sclk_io_num = sclk_;
     buscfg.quadwp_io_num = -1;
     buscfg.quadhd_io_num = -1;
     buscfg.max_transfer_sz = 256;
@@ -144,9 +160,9 @@ void Dwm1000Driver::sendFrame(const uint8_t* data, size_t len) {
     if (len > 127) len = 127;
     spiWrite(0x0C, data, len); /* simplified TX BUFFER write */
 
-    /* Set TX_FCTRL (frame length) */
-    uint8_t fctrl[2] = {(uint8_t)(len * 8), (uint8_t)((len * 8) >> 8)};
-    spiWrite(0x0C, fctrl, 2); /* simplified */
+    /* Set TX_FCTRL (frame length in octets/bytes: bits 0..6) */
+    uint8_t fctrl[2] = {(uint8_t)(len & 0x7F), (uint8_t)((len >> 7) & 0x07)};
+    spiWrite(0x0C, fctrl, 2);
 
     /* Start TX: SYS_CTRL.TXSTRT = 1 */
     uint8_t tx_ctrl = 0x02; /* TXSTRT bit */

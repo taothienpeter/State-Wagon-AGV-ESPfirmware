@@ -48,8 +48,9 @@ static volatile bool  g_imu_updated = false;
 static volatile float g_uwb_x = 0, g_uwb_y = 0;
 static volatile bool  g_uwb_updated = false;
 
-/* Current order ID (set on order received, cleared on reset) */
+/* Current order ID (set on order received, protected by g_order_mux) */
 static char g_current_order_id[64] = "";
+static portMUX_TYPE g_order_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* Vehicle geometry for kinematics (no track_width in v2) */
 static VehicleGeometry g_vehicle_geom = {
@@ -89,12 +90,13 @@ static void plannerTaskFunc(void* arg) {
         /* 1. Read STM32 feedback for wheel odometry */
         motion_fb_t fb;
         float delta_x = 0, delta_y = 0, delta_theta = 0;
-        if (g_stm_link.getLatestFeedback(fb, 300)) {
-            /* Use fromWheelFeedback for proper bicycle-model odometry.
-               Both wheels assumed same steering (single feedback axis). */
+        bool has_fb = g_stm_link.getLatestFeedback(fb, 300);
+        if (has_fb) {
+            /* Bicycle-model odometry: front wheel steers, rear wheel fixed (0 rad).
+               Produces correct angular velocity omega = v * sin(steer) / L. */
             float steer_angle = fb.steering_angle_actual_rad;
             float v_drive = fb.drive_velocity_actual_mps;
-            float angles[2] = {steer_angle, steer_angle};
+            float angles[2] = {steer_angle, 0.0f};
             float speeds[2] = {v_drive, v_drive};
             BodyVelocity odom = g_kinematics.fromWheelFeedback(angles, speeds);
 
@@ -103,8 +105,8 @@ static void plannerTaskFunc(void* arg) {
             delta_theta = odom.omega_radps * dt_s;
         }
 
-        /* 2. EKF predict (wheel odometry) */
-        g_ekf.predict(delta_x, delta_y, delta_theta);
+        /* 2. EKF predict (wheel odometry + dynamic dt_s) */
+        g_ekf.predict(delta_x, delta_y, delta_theta, dt_s);
 
         /* 3. EKF update from IMU heading */
         portENTER_CRITICAL(&ekf_mux);
@@ -145,10 +147,20 @@ static void plannerTaskFunc(void* arg) {
         SwerveCommand wheels[2];
         bool has_cmd = g_kinematics.toSwerveCommand(body_v, dt_s, wheels);
 
+        TrajStatus traj_status = g_trajectory.status();
+
         /* ---- Accumulate wheel turns for ODrive position control ---- */
         const float wheel_circumference = 2.0f * 3.14159265f * AGV_WHEEL_RADIUS_M;
         static float accumulated_turns = 0.0f;
-        if (has_cmd) {
+        static bool position_synced = false;
+
+        /* Sync accumulator with actual encoder position when starting or while idle */
+        if (has_fb && (!position_synced || traj_status == TrajStatus::IDLE)) {
+            accumulated_turns = fb.drive_pos_actual_turns;
+            position_synced = true;
+        }
+
+        if (has_cmd && traj_status == TrajStatus::ACTIVE) {
             float wheel_rps = wheels[0].drive_velocity_mps / wheel_circumference;
             accumulated_turns += wheel_rps * dt_s;
         }
@@ -157,8 +169,6 @@ static void plannerTaskFunc(void* arg) {
         motion_cmd_t cmd;
         memset(&cmd, 0, sizeof(cmd));
         cmd.timestamp_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-
-        TrajStatus traj_status = g_trajectory.status();
 
         if (traj_status == TrajStatus::ESTOP) {
             cmd.mode = MODE_SAFE_STOP;
@@ -209,9 +219,11 @@ static void uwbTaskFunc(void* arg) {
 
     vTaskDelay(pdMS_TO_TICKS(200));
 
-    Dwm1000Driver uwb(UWB_SPI_HOST, UWB_SPI_CS, UWB_SPI_IRQ);
-    if (!uwb.begin()) {
-        ESP_LOGE(TAG, "DWM1000 init failed — EKF uses odometry + IMU only");
+    Dwm1000Driver uwb(UWB_SPI_HOST, UWB_SPI_CS, UWB_SPI_IRQ, -1,
+                      UWB_SPI_MOSI, UWB_SPI_MISO, UWB_SPI_CLK);
+    bool uwb_available = uwb.begin();
+    if (!uwb_available) {
+        ESP_LOGW(TAG, "DWM1000 init skipped/failed — EKF uses odometry + IMU only");
     }
 
     const float anchors[4][3] = {
@@ -228,16 +240,18 @@ static void uwbTaskFunc(void* arg) {
     while (1) {
         vTaskDelayUntil(&last_wake, period);
 
-        float ranges[MAX_ANCHORS];
-        int count = 0;
-        if (uwb.doRanging(ranges, count) && count >= 3) {
-            float x, y;
-            if (uwb.trilaterate(ranges, count, x, y)) {
-                portENTER_CRITICAL(&ekf_mux);
-                g_uwb_x = x;
-                g_uwb_y = y;
-                g_uwb_updated = true;
-                portEXIT_CRITICAL(&ekf_mux);
+        if (uwb_available) {
+            float ranges[MAX_ANCHORS];
+            int count = 0;
+            if (uwb.doRanging(ranges, count) && count >= 3) {
+                float x, y;
+                if (uwb.trilaterate(ranges, count, x, y)) {
+                    portENTER_CRITICAL(&ekf_mux);
+                    g_uwb_x = x;
+                    g_uwb_y = y;
+                    g_uwb_updated = true;
+                    portEXIT_CRITICAL(&ekf_mux);
+                }
             }
         }
     }
@@ -248,6 +262,9 @@ static void statePublishTaskFunc(void* arg) {
     (void)arg;
     TickType_t last_wake = xTaskGetTickCount();
     const TickType_t period = pdMS_TO_TICKS(1000 / AGV_STATE_PUBLISH_HZ);
+
+    static StaticJsonDocument<1536> doc;
+    static char json_buf[1536];
 
     while (1) {
         vTaskDelayUntil(&last_wake, period);
@@ -267,23 +284,34 @@ static void statePublishTaskFunc(void* arg) {
         bool fb_valid = g_stm_link.getLatestFeedback(fb, 500);
         bool link_ok = g_stm_link.linkOk();
 
-        /* Determine operating mode from trajectory state */
-        const char* operating_mode = "AUTOMATIC";
+        /* Read current orderId safely */
+        char current_order_id[64];
+        portENTER_CRITICAL(&g_order_mux);
+        strncpy(current_order_id, g_current_order_id, sizeof(current_order_id) - 1);
+        current_order_id[sizeof(current_order_id) - 1] = 0;
+        portEXIT_CRITICAL(&g_order_mux);
+
+        /* Determine operating mode and safety state */
         TrajStatus ts = g_trajectory.status();
-        if (ts == TrajStatus::ESTOP) operating_mode = "EMERGENCY";
-        else if (ts == TrajStatus::PAUSED) operating_mode = "MANUAL";
+        const char* operating_mode = (ts == TrajStatus::ESTOP) ? "MANUAL" : "AUTOMATIC";
 
-        /* Determine safety state */
-        uint8_t safety_state = fb_valid ? fb.safety_state : 2; /* SAFE_STOP if no FB */
+        const char* safety_state_str = "NORMAL";
+        if (ts == TrajStatus::ESTOP) {
+            safety_state_str = "SAFE_STOP";
+        } else {
+            uint8_t safety_state = fb_valid ? fb.safety_state : 2; /* SAFE_STOP if no FB */
+            safety_state_str = (safety_state == 0) ? "NORMAL" :
+                               (safety_state == 1) ? "WARN" :
+                               (safety_state == 2) ? "SAFE_STOP" : "FAULT_LATCHED";
+        }
 
-        /* Build state JSON payload using ArduinoJson */
-        DynamicJsonDocument doc(1024);
+        /* Build state JSON payload (zero-malloc) */
+        doc.clear();
 
-        doc["orderId"] = g_current_order_id;
+        doc["orderId"] = (current_order_id[0] != '\0') ? current_order_id : nullptr;
+        doc["orderState"] = g_trajectory.orderStateString();
         doc["operatingMode"] = operating_mode;
-        doc["safetyState"] = safety_state == 0 ? "NORMAL" :
-                             safety_state == 1 ? "WARN" :
-                             safety_state == 2 ? "SAFE_STOP" : "FAULT_LATCHED";
+        doc["safetyState"] = safety_state_str;
 
         JsonObject pos = doc.createNestedObject("position");
         pos["x"] = px;
@@ -292,20 +320,31 @@ static void statePublishTaskFunc(void* arg) {
 
         JsonObject vel = doc.createNestedObject("velocity");
         vel["vx"] = vx;
+        vel["vy"] = 0.0f;
         vel["omega"] = omega;
 
         JsonObject bat = doc.createNestedObject("battery");
         bat["percentage"] = 85.0f; /* placeholder — implement ADC reading */
         bat["voltage"] = fb_valid ? fb.odrive_vbus_v : 0.0f;
+        bat["charging"] = false;
 
         JsonObject imu_obj = doc.createNestedObject("imu");
+        JsonArray accel = imu_obj.createNestedArray("accel");
+        accel.add(0.0f);
+        accel.add(0.0f);
+        accel.add(9.8f);
+        JsonArray gyro = imu_obj.createNestedArray("gyro");
+        gyro.add(0.0f);
+        gyro.add(0.0f);
+        gyro.add(0.0f);
         imu_obj["heading_rad"] = imu_h;
         imu_obj["calibration_status"] = 3; /* placeholder — read full cal status */
 
         JsonObject uwb_obj = doc.createNestedObject("uwb");
+        uwb_obj["anchors"] = UWB_ANCHOR_COUNT;
+        uwb_obj["quality"] = 0.0f;
         uwb_obj["x"] = uwb_x;
         uwb_obj["y"] = uwb_y;
-        uwb_obj["anchor_count"] = UWB_ANCHOR_COUNT;
 
         JsonArray controllers = doc.createNestedArray("driveControllers");
         JsonObject ctrl = controllers.createNestedObject();
@@ -316,12 +355,11 @@ static void statePublishTaskFunc(void* arg) {
         ctrl["odriveErrors"] = fb_valid ? fb.odrive_error_flags : 0;
         ctrl["stepperHomed"] = fb_valid ? fb.stepper_homed : 0;
 
-        size_t len = measureJson(doc) + 1;
-        char* json = (char*)malloc(len);
-        if (json) {
-            serializeJson(doc, json, len);
-            g_hop1->publishState(json);
-            free(json);
+        doc.createNestedArray("errors");
+
+        size_t len = serializeJson(doc, json_buf, sizeof(json_buf));
+        if (len > 0 && len < sizeof(json_buf)) {
+            g_hop1->publishState(json_buf);
         }
     }
 }
@@ -345,22 +383,30 @@ static void heartbeatTaskFunc(void* arg) {
    Callbacks
    ===================================================================== */
 static void onOrderReceived(const char* order_id, const char* waypoints_json) {
-    ESP_LOGI(TAG, "Order received: %s, waypoints: %s", order_id, waypoints_json);
+    ESP_LOGI(TAG, "Order received: %s", order_id ? order_id : "(null)");
 
-    /* Store current order ID */
-    strncpy(g_current_order_id, order_id, sizeof(g_current_order_id) - 1);
-    g_current_order_id[sizeof(g_current_order_id) - 1] = 0;
-
-    /* Parse waypoints JSON array into vector<Waypoint> */
-    DynamicJsonDocument doc(2048);
-    DeserializationError err = deserializeJson(doc, waypoints_json);
+    static StaticJsonDocument<16384> order_doc;
+    order_doc.clear();
+    DeserializationError err = deserializeJson(order_doc, waypoints_json);
     if (err) {
         ESP_LOGE(TAG, "Failed to parse waypoints: %s", err.c_str());
+        if (g_hop1) {
+            g_hop1->sendAck(order_id, "REJECTED", "JSON parse error");
+        }
         return;
     }
 
-    JsonArray arr = doc.as<JsonArray>();
+    JsonArray arr = order_doc.as<JsonArray>();
+    if (arr.isNull() || arr.size() == 0) {
+        ESP_LOGW(TAG, "Empty waypoint list — rejecting order");
+        if (g_hop1) {
+            g_hop1->sendAck(order_id, "REJECTED", "Empty waypoint list");
+        }
+        return;
+    }
+
     std::vector<Waypoint> wps;
+    wps.reserve(arr.size());
     for (JsonObject wp : arr) {
         Waypoint w;
         w.x = wp["x"] | 0.0f;
@@ -370,12 +416,18 @@ static void onOrderReceived(const char* order_id, const char* waypoints_json) {
         wps.push_back(w);
     }
 
-    if (wps.empty()) {
-        ESP_LOGW(TAG, "Empty waypoint list — ignoring order");
-        return;
-    }
+    /* Store current order ID */
+    portENTER_CRITICAL(&g_order_mux);
+    strncpy(g_current_order_id, order_id, sizeof(g_current_order_id) - 1);
+    g_current_order_id[sizeof(g_current_order_id) - 1] = 0;
+    portEXIT_CRITICAL(&g_order_mux);
 
     g_trajectory.loadWaypoints(wps);
+
+    /* Send ACCEPTED ack */
+    if (g_hop1) {
+        g_hop1->sendAck(order_id, "ACCEPTED");
+    }
 }
 
 static void onInstantAction(const char* action_type) {
@@ -496,7 +548,7 @@ extern "C" void app_main(void) {
     g_kinematics = SwerveKinematics(g_vehicle_geom);
 
     /* ---- Init Hop1 client ---- */
-    g_hop1 = new Hop1Client(AGV_DEFAULT_VEHICLE_ID, AGV_DEFAULT_SERVER_HOST, AGV_DEFAULT_SERVER_PORT);
+    g_hop1 = new Hop1Client(AGV_DEFAULT_VEHICLE_ID, AGV_DEFAULT_SERVER_HOST, AGV_DEFAULT_SERVER_PORT, AGV_MAX_VELOCITY_MPS);
     g_hop1->onOrder(onOrderReceived);
     g_hop1->onInstantAction(onInstantAction);
     g_hop1->begin();
@@ -513,7 +565,7 @@ extern "C" void app_main(void) {
     xTaskCreatePinnedToCore(&uwbTaskFunc, "uwb_ranging", 4096, NULL, 5, NULL, 0);
 
     /* State publish: core 0, priority 5, 8 Hz */
-    xTaskCreatePinnedToCore(&statePublishTaskFunc, "state_pub", 4096, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(&statePublishTaskFunc, "state_pub", 6144, NULL, 5, NULL, 0);
 
     /* Heartbeat: core 0, priority 3, 1 Hz */
     xTaskCreatePinnedToCore(&heartbeatTaskFunc, "heartbeat", 2048, NULL, 3, NULL, 0);

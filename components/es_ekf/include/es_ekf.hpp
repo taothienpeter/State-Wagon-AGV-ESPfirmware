@@ -12,7 +12,7 @@ public:
     void init(float dt, float init_x, float init_y, float init_theta);
     
     // Bước 1: Predict (Cập nhật từ Encoder)
-    void predict(float delta_x, float delta_y, float delta_theta);
+    void predict(float delta_x, float delta_y, float delta_theta, float dt_step = 0.0f);
     
     // Bước 2 & 3: Update và Inject từ IMU (khi không có UWB)
     void updateIMU(float imu_theta);

@@ -17,14 +17,14 @@ bool Bno055Driver::writeReg(uint8_t reg, uint8_t val) {
     esp_err_t ret;
     uint8_t buf[2] = {reg, val};
 
-    /* Use i2c_master_transmit for the ESP-IDF I2C master driver */
-    ret = i2c_master_transmit(dev_handle_, buf, 2, -1);
+    /* Use i2c_master_transmit with 50ms timeout */
+    ret = i2c_master_transmit(dev_handle_, buf, 2, 50);
     return ret == ESP_OK;
 }
 
 bool Bno055Driver::readRegs(uint8_t reg, uint8_t* buf, size_t len) {
     esp_err_t ret;
-    ret = i2c_master_transmit_receive(dev_handle_, &reg, 1, buf, len, -1);
+    ret = i2c_master_transmit_receive(dev_handle_, &reg, 1, buf, len, 50);
     return ret == ESP_OK;
 }
 

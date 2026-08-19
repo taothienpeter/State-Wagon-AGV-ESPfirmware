@@ -30,30 +30,31 @@ void ES_EKF::init(float delta_t, float init_x, float init_y, float init_theta) {
 }
 
 // --------- B1: PREDICT ---------
-void ES_EKF::predict(float delta_x, float delta_y, float delta_theta) {
+void ES_EKF::predict(float delta_x, float delta_y, float delta_theta, float dt_step) {
+    float cur_dt = (dt_step > 0.0001f) ? dt_step : this->dt;
     delta_theta = normalizeAngle(delta_theta);
 
     // Cập nhật vận tốc
-    x_nom[3] = delta_x / dt;
-    x_nom[4] = delta_y / dt;
-    x_nom[5] = delta_theta / dt;
+    x_nom[3] = delta_x / cur_dt;
+    x_nom[4] = delta_y / cur_dt;
+    x_nom[5] = delta_theta / cur_dt;
     
     // Cập nhật vị trí
-    x_nom[0] += x_nom[3] * dt;
-    x_nom[1] += x_nom[4] * dt;
-    x_nom[2] += x_nom[5] * dt;
+    x_nom[0] += delta_x;
+    x_nom[1] += delta_y;
+    x_nom[2] += delta_theta;
     x_nom[2] = normalizeAngle(x_nom[2]);
 
     // Ma trận Jacobian F_err (Tối ưu hóa phép nhân thay vì nhân ma trận 6x6)
-    // F_err = I(6) + dt * [0 0 0 1 0 0; 0 0 0 0 1 0; 0 0 0 0 0 1]
+    // F_err = I(6) + cur_dt * [0 0 0 1 0 0; 0 0 0 0 1 0; 0 0 0 0 0 1]
     // Tính P = F * P * F^T + Q
     float P_new[6][6];
     for (int i = 0; i < 6; i++) {
         for (int j = 0; j < 6; j++) {
             float val = P[i][j];
-            if (i < 3) val += dt * P[i + 3][j];
-            if (j < 3) val += dt * P[i][j + 3];
-            if (i < 3 && j < 3) val += dt * dt * P[i + 3][j + 3];
+            if (i < 3) val += cur_dt * P[i + 3][j];
+            if (j < 3) val += cur_dt * P[i][j + 3];
+            if (i < 3 && j < 3) val += cur_dt * cur_dt * P[i + 3][j + 3];
             
             P_new[i][j] = val;
             if (i == j) P_new[i][j] += Q[i]; // Cộng Q vào đường chéo

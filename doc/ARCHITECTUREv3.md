@@ -82,11 +82,12 @@ setpoint, and ODrive's `input_pos_filter` handles the smoothing internally.
 - No TLS (add in production if facility network requires it)
 - ESP32 sends state at 8 Hz; if 3 consecutive seconds with no state, server
   marks vehicle `OFFLINE`
+- **Receive Buffer on ESP32:** 16 KB persistent buffer (handles max 200 waypoints ~11.8 KB).
 
 **Message Envelope** (all Hop 1 messages):
 ```json
 {
-  "type": "order|state|connection|instantAction",
+  "type": "order|state|connection|instantAction|ack",
   "vehicleId": "agv-07",
   "payload": { ... }
 }
@@ -104,9 +105,9 @@ setpoint, and ODrive's `input_pos_filter` handles the smoothing internally.
   "payload": {
     "orderId": "ord-2026-0001",
     "waypoints": [
-      {"x": 0.0, "y": 0.0, "max_speed_mps": 0.8},
-      {"x": 2.5, "y": 0.0, "max_speed_mps": 0.8},
-      {"x": 5.0, "y": 1.5, "max_speed_mps": 0.6}
+      {"x": 0.0, "y": 0.0, "max_speed_mps": 0.8, "tolerance_m": 0.05},
+      {"x": 2.5, "y": 0.0, "max_speed_mps": 0.8, "tolerance_m": 0.05},
+      {"x": 5.0, "y": 1.5, "max_speed_mps": 0.6, "tolerance_m": 0.05}
     ]
   }
 }
@@ -114,22 +115,42 @@ setpoint, and ODrive's `input_pos_filter` handles the smoothing internally.
 Optional field: `tolerance_m` (per-waypoint, defaults to 0.05 m).
 
 **Only flat waypoints are supported.** If curved paths are needed, the server
-pre-computes them into dense waypoints.
+pre-computes them into dense waypoints (up to 200 points).
 
-#### 2.1.2 `state` (ESP32 → Server, ~8 Hz)
+#### 2.1.2 `ack` (ESP32 → Server)
+Sent immediately upon receiving an `order` (required for confirmed dispatch when `order_ack_enabled=true`):
+```json
+{
+  "type": "ack",
+  "vehicleId": "agv-07",
+  "payload": {
+    "orderId": "ord-2026-0001",
+    "status": "ACCEPTED",
+    "reason": "Optional rejection reason if status is REJECTED"
+  }
+}
+```
+
+#### 2.1.3 `state` (ESP32 → Server, ~8 Hz)
 ```json
 {
   "type": "state",
   "vehicleId": "agv-07",
   "payload": {
     "orderId": "ord-2026-0001",
+    "orderState": "ACTIVE",
     "operatingMode": "AUTOMATIC",
     "safetyState": "NORMAL",
     "position": {"x": 1.23, "y": 0.45, "theta": 0.17},
-    "velocity": {"vx": 0.62, "omega": 0.01},
-    "battery": {"percentage": 85.0, "voltage": 24.6},
-    "imu": {"heading_rad": 0.17, "calibration_status": 3},
-    "uwb": {"x": 1.22, "y": 0.44, "anchor_count": 4},
+    "velocity": {"vx": 0.62, "vy": 0.0, "omega": 0.01},
+    "battery": {"percentage": 85.0, "voltage": 24.8, "charging": false},
+    "imu": {
+      "accel": [0.0, 0.0, 9.8],
+      "gyro": [0.0, 0.0, 0.0],
+      "heading_rad": 0.17,
+      "calibration_status": 3
+    },
+    "uwb": {"anchors": 4, "quality": 0.0, "x": 1.22, "y": 0.44},
     "driveControllers": [
       {
         "id": "stm32-main",
@@ -137,33 +158,36 @@ pre-computes them into dense waypoints.
         "faultCode": 0,
         "odriveVbus": 24.8,
         "odriveErrors": 0,
-        "stepperHomed": true
+        "stepperHomed": 1
       }
-    ]
+    ],
+    "errors": []
   }
 }
 ```
 
-**Operating mode mapping:**
-- `ESTOP` → `"EMERGENCY"`
-- `PAUSED` → `"MANUAL"`
-- otherwise → `"AUTOMATIC"`
+**Field Rules:**
+- `orderId`: Set to JSON `null` when vehicle is IDLE (no active/completed order).
+- `orderState`: `"IDLE"` | `"ACTIVE"` | `"PAUSED"` | `"COMPLETED"` | `"ESTOP"`.
+- `operatingMode`: `"MANUAL"` during ESTOP / Pause, `"AUTOMATIC"` normally. *(Never use `"EMERGENCY"`).*
+- `safetyState`: `"NORMAL"` | `"WARN"` | `"SAFE_STOP"` | `"FAULT_LATCHED"`.
 
-**Note:** `battery.percentage` is currently a hardcoded placeholder (85.0).
-Actual ADC-based battery monitoring is not yet implemented. `imu.calibration_status`
-is also a hardcoded placeholder (3).
-
-#### 2.1.3 `connection` (both directions, handshake)
-Sent by ESP32 on TCP connect:
+#### 2.1.4 `connection` (both directions, handshake)
+Sent by ESP32 on TCP connect with capabilities:
 ```json
 {
   "type": "connection",
   "vehicleId": "agv-07",
-  "payload": {"connectionState": "ONLINE"}
+  "payload": {
+    "connectionState": "ONLINE",
+    "capabilities": {
+      "max_speed_mps": 1.2
+    }
+  }
 }
 ```
 
-#### 2.1.4 `instantAction` (Server → ESP32, high priority)
+#### 2.1.5 `instantAction` (Server → ESP32, high priority)
 ```json
 {
   "type": "instantAction",
@@ -400,7 +424,9 @@ identical copy. A struct size mismatch causes frame CRC rejection silently.
 class Hop1Client {
 public:
     Hop1Client(const char* vehicle_id,
-               const char* server_host, uint16_t server_port);
+               const char* server_host, uint16_t server_port,
+               float max_speed_mps = 1.2f);
+    ~Hop1Client();
 
     void begin();
 
@@ -410,6 +436,7 @@ public:
     void onOrder(OrderCallback cb);
     void onInstantAction(ActionCallback cb);
 
+    void sendAck(const char* order_id, const char* status, const char* reason = nullptr);
     void publishState(const char* state_payload_json);
 
     Hop1State linkState() const;
@@ -418,14 +445,16 @@ public:
 ```
 
 **Behavior:**
-- FreeRTOS task created on begin(): core 0, priority 6, stack 8192
+- FreeRTOS task created on `begin()`: core 0, priority 6, stack 8192
 - Persistent TCP client with auto-reconnect and exponential backoff (500 ms → 15 s)
-- Socket timeout: 5 seconds (SO_RCVTIMEO, SO_SNDTIMEO)
-- Sends connection handshake on connect
-- Receives 4-byte big-endian length-prefixed JSON frames, dispatches orders/instant actions
-- On order received: extracts `orderId`, serializes `waypoints` array back to JSON, passes to callback
+- Socket timeout: 5 seconds (`SO_RCVTIMEO`, `SO_SNDTIMEO`)
+- Sends connection handshake on connect with `capabilities.max_speed_mps`
+- Receives 4-byte big-endian length-prefixed JSON frames into persistent 16 KB buffer (`recv_buf_`)
+- Zero-malloc parsing: parses into member `StaticJsonDocument<16384> incoming_doc_` and serializes waypoints into `char wps_scratch_[16384]`
+- On order received: extracts `orderId`, serializes `waypoints` array into scratch buffer, passes to callback
 - On instantAction: extracts `actionType`, passes to callback
-- `publishState`: wraps payload in envelope `{"type":"state","vehicleId":"...","payload":{...}}`, sends via TCP
+- `sendAck`: sends `{"type":"ack","vehicleId":"...","payload":{"orderId":"...","status":"ACCEPTED|REJECTED"}}`
+- `sendEnvelope`: thread-safe (protected by `send_mux_`), sends via TCP with loop handling partial sends
 
 **State machine:**
 - `DISCONNECTED` → `CONNECTING` (backoff 500 ms, doubles to 15 s)
@@ -460,7 +489,7 @@ public:
 - RX: byte-level state machine, resync on STX, validates CRC
 - TX: non-blocking `uart_write_bytes()`, no separate TX task
 - Thread-safe feedback via spinlock
-- Safety events queued via UART driver's built-in event queue (size 10)
+- Safety events queued via dedicated FreeRTOS queue
 - `linkOk()`: returns true if last received frame within 300 ms
 - CRC errors tracked in `rx_crc_err_count_`
 
@@ -547,6 +576,7 @@ enum class TrajStatus : uint8_t {
 class TrajectoryGen {
 public:
     explicit TrajectoryGen(const MotionProfile& profile = MotionProfile{});
+    ~TrajectoryGen();
 
     void loadWaypoints(const std::vector<Waypoint>& wps);
     void reset();
@@ -559,12 +589,15 @@ public:
     BodyVelocity tick(const float pose[3], float dt_s);
 
     TrajStatus status() const;
+    const char* orderStateString() const;
     float currentSpeedMps() const;
     int activeIndex() const;
 };
 ```
 
-**Behavior:**
+**Behavior & Thread Safety:**
+- **Thread Safety:** Protected by FreeRTOS **Recursive Mutex** (`mux_`) under `#if defined(ESP_PLATFORM)`. All public methods take and release the recursive lock safely, preventing data races between `hop1_task` and `planner` task.
+- **`orderStateString()`:** Maps internal state to server strings (`"IDLE"`, `"ACTIVE"`, `"PAUSED"`, `"COMPLETED"`, `"ESTOP"`).
 - **Flat waypoints only.**
 - **Trapezoidal speed profile:**
   - Computes stopping distance: `d_stop = v² / (2 × max_decel)`
@@ -574,7 +607,7 @@ public:
 - **Heading control:** Pure P-controller via `steering_gain × heading_error`.
   Heading error clamped to ±60° (`PI_OVER_3`).
 - **Arrival detection:** Distance to waypoint < `tolerance_m` → advance index.
-  Recursively processes next waypoint on same tick if multiple reached.
+  Recursively processes next waypoint on same tick if multiple reached (recursive mutex prevents self-deadlock).
 - **ESTOP:** Returns zero velocity, status set to ESTOP.
 
 ### 4.5 BNO055 IMU Driver — `components/imu/bno055_driver.h/.cpp`

@@ -11,13 +11,22 @@
 
 static const char* TAG = "Hop1Client";
 
-Hop1Client::Hop1Client(const char* vehicle_id, const char* host, uint16_t port)
-    : port_(port), state_(Hop1State::DISCONNECTED), sock_(-1), has_pending_(false)
+Hop1Client::Hop1Client(const char* vehicle_id, const char* host, uint16_t port, float max_speed_mps)
+    : port_(port), max_speed_mps_(max_speed_mps), state_(Hop1State::DISCONNECTED),
+      sock_(-1), send_mux_(nullptr)
 {
     strncpy(vehicle_id_, vehicle_id, sizeof(vehicle_id_) - 1);
     vehicle_id_[sizeof(vehicle_id_) - 1] = 0;
     strncpy(host_, host, sizeof(host_) - 1);
     host_[sizeof(host_) - 1] = 0;
+    send_mux_ = xSemaphoreCreateMutex();
+}
+
+Hop1Client::~Hop1Client() {
+    if (send_mux_) {
+        vSemaphoreDelete(send_mux_);
+        send_mux_ = nullptr;
+    }
 }
 
 void Hop1Client::begin() {
@@ -96,16 +105,18 @@ bool Hop1Client::connectOnce() {
     freeaddrinfo(res);
     sock_ = s;
 
-    /* Send connection handshake */
-    sendEnvelope(sock_, "connection", "{\"connectionState\":\"ONLINE\"}");
+    /* Send connection handshake with capabilities */
+    char conn_payload[128];
+    snprintf(conn_payload, sizeof(conn_payload),
+             "{\"connectionState\":\"ONLINE\",\"capabilities\":{\"max_speed_mps\":%.2f}}",
+             (double)max_speed_mps_);
+    sendEnvelope(sock_, "connection", conn_payload);
 
     ESP_LOGI(TAG, "Connected to server %s:%u", host_, port_);
     return true;
 }
 
 void Hop1Client::handleIncomingLoop(int sock) {
-    uint8_t buf[4096];
-
     while (1) {
         /* Read 4-byte length prefix */
         uint8_t len_buf[4];
@@ -118,46 +129,49 @@ void Hop1Client::handleIncomingLoop(int sock) {
                          | (uint32_t)len_buf[1] << 16
                          | (uint32_t)len_buf[2] << 8
                          | (uint32_t)len_buf[3];
-        if (msg_len == 0 || msg_len > sizeof(buf) - 1) {
+        if (msg_len == 0 || msg_len > sizeof(recv_buf_) - 1) {
             ESP_LOGW(TAG, "Invalid message length: %lu", (unsigned long)msg_len);
             return;
         }
 
         /* Read JSON payload */
-        r = recv(sock, (char*)buf, msg_len, MSG_WAITALL);
+        r = recv(sock, (char*)recv_buf_, msg_len, MSG_WAITALL);
         if (r <= 0) {
             ESP_LOGW(TAG, "Connection lost (payload)");
             return;
         }
-        buf[msg_len] = 0;
+        recv_buf_[msg_len] = 0;
 
         /* Dispatch */
-        DynamicJsonDocument doc(4096);
-        DeserializationError err = deserializeJson(doc, (const char*)buf);
-        if (err) continue;
+        incoming_doc_.clear();
+        DeserializationError err = deserializeJson(incoming_doc_, (const char*)recv_buf_);
+        if (err) {
+            ESP_LOGW(TAG, "deserializeJson failed: %s", err.c_str());
+            continue;
+        }
 
-        const char* type = doc["type"];
+        const char* type = incoming_doc_["type"];
         if (!type) continue;
 
         if (strcmp(type, "order") == 0 && order_cb_) {
             /* Extract orderId and waypoints from payload */
-            JsonObject payload = doc["payload"];
+            JsonObject payload = incoming_doc_["payload"];
             const char* order_id = payload["orderId"] | "";
-            /* Serialize waypoints array back to JSON string for the callback */
+            /* Serialize waypoints array into scratch buffer (no malloc) */
             JsonArray wps = payload["waypoints"];
             if (wps.size() > 0) {
-                size_t wps_len = measureJson(wps) + 1;
-                char* wps_json = (char*)malloc(wps_len);
-                if (wps_json) {
-                    serializeJson(wps, wps_json, wps_len);
-                    order_cb_(order_id, wps_json);
-                    free(wps_json);
+                size_t wps_len = measureJson(wps);
+                if (wps_len < sizeof(wps_scratch_)) {
+                    serializeJson(wps, wps_scratch_, sizeof(wps_scratch_));
+                    order_cb_(order_id, wps_scratch_);
+                } else {
+                    ESP_LOGE(TAG, "Order waypoints JSON exceeds scratch buffer (%zu B)", wps_len);
                 }
             } else {
                 order_cb_(order_id, "[]");
             }
         } else if (strcmp(type, "instantAction") == 0 && action_cb_) {
-            JsonObject payload = doc["payload"];
+            JsonObject payload = incoming_doc_["payload"];
             const char* action_type = payload["actionType"] | "";
             action_cb_(action_type);
         }
@@ -165,39 +179,79 @@ void Hop1Client::handleIncomingLoop(int sock) {
 }
 
 void Hop1Client::sendEnvelope(int sock, const char* type, const char* payload) {
-    DynamicJsonDocument doc(2048);
+    if (sock < 0) return;
+
+    if (send_mux_) xSemaphoreTake(send_mux_, portMAX_DELAY);
+
+    static StaticJsonDocument<2048> doc;
+    static StaticJsonDocument<1024> payload_doc;
+    static char buf[2048];
+
+    doc.clear();
     doc["type"] = type;
     doc["vehicleId"] = vehicle_id_;
     JsonObject payload_obj = doc.createNestedObject("payload");
 
     /* Parse the payload string into the envelope */
-    DynamicJsonDocument payload_doc(1024);
+    payload_doc.clear();
     DeserializationError err = deserializeJson(payload_doc, payload);
     if (!err) {
         payload_obj.set(payload_doc.as<JsonObject>());
     }
 
-    size_t len = measureJson(doc) + 1;
-    char* buf = (char*)malloc(len);
-    if (buf) {
-        serializeJson(doc, buf, len);
-        sendFrame(sock, buf, strlen(buf));
-        free(buf);
+    size_t written = serializeJson(doc, buf, sizeof(buf));
+    if (written > 0 && written < sizeof(buf)) {
+        sendFrame(sock, buf, written);
     }
+
+    if (send_mux_) xSemaphoreGive(send_mux_);
 }
 
 void Hop1Client::sendFrame(int sock, const char* data, size_t len) {
+    if (sock < 0 || !data || len == 0) return;
+
     uint8_t prefix[4];
     prefix[0] = (len >> 24) & 0xFF;
     prefix[1] = (len >> 16) & 0xFF;
     prefix[2] = (len >> 8) & 0xFF;
     prefix[3] = len & 0xFF;
 
-    send(sock, (char*)prefix, 4, 0);
-    send(sock, data, len, 0);
+    /* Send prefix */
+    size_t total_sent = 0;
+    while (total_sent < 4) {
+        int ret = send(sock, (char*)prefix + total_sent, 4 - total_sent, 0);
+        if (ret <= 0) return;
+        total_sent += ret;
+    }
+
+    /* Send payload */
+    total_sent = 0;
+    while (total_sent < len) {
+        int ret = send(sock, data + total_sent, len - total_sent, 0);
+        if (ret <= 0) return;
+        total_sent += ret;
+    }
+}
+
+void Hop1Client::sendAck(const char* order_id, const char* status, const char* reason) {
+    if (state_ != Hop1State::CONNECTED || sock_ < 0 || !order_id) return;
+
+    StaticJsonDocument<256> ack_doc;
+    ack_doc["orderId"] = order_id;
+    ack_doc["status"] = status ? status : "ACCEPTED";
+    if (reason && reason[0] != '\0') {
+        ack_doc["reason"] = reason;
+    }
+
+    char payload[256];
+    size_t len = serializeJson(ack_doc, payload, sizeof(payload));
+    if (len > 0 && len < sizeof(payload)) {
+        sendEnvelope(sock_, "ack", payload);
+    }
 }
 
 void Hop1Client::publishState(const char* state_payload_json) {
     if (state_ != Hop1State::CONNECTED || sock_ < 0) return;
     sendEnvelope(sock_, "state", state_payload_json);
 }
+

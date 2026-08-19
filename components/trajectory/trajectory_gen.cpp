@@ -14,48 +14,128 @@ TrajectoryGen::TrajectoryGen(const MotionProfile& profile)
     : active_index_(-1), current_speed_mps_(0),
       paused_(false), estop_(false),
       status_(TrajStatus::IDLE), profile_(profile)
-{}
+#if defined(ESP_PLATFORM)
+      , mux_(nullptr)
+#endif
+{
+#if defined(ESP_PLATFORM)
+    mux_ = xSemaphoreCreateRecursiveMutex();
+#endif
+}
+
+TrajectoryGen::~TrajectoryGen() {
+#if defined(ESP_PLATFORM)
+    if (mux_) {
+        vSemaphoreDelete(mux_);
+        mux_ = nullptr;
+    }
+#endif
+}
+
+void TrajectoryGen::lock() const {
+#if defined(ESP_PLATFORM)
+    if (mux_) {
+        xSemaphoreTakeRecursive(mux_, portMAX_DELAY);
+    }
+#endif
+}
+
+void TrajectoryGen::unlock() const {
+#if defined(ESP_PLATFORM)
+    if (mux_) {
+        xSemaphoreGiveRecursive(mux_);
+    }
+#endif
+}
 
 void TrajectoryGen::loadWaypoints(const std::vector<Waypoint>& wps) {
+    lock();
     waypoints_ = wps;
     active_index_ = waypoints_.empty() ? -1 : 0;
     current_speed_mps_ = 0;
     paused_ = false;
     estop_ = false;
     status_ = waypoints_.empty() ? TrajStatus::IDLE : TrajStatus::ACTIVE;
+    unlock();
 }
 
 void TrajectoryGen::reset() {
+    lock();
     waypoints_.clear();
     active_index_ = -1;
     current_speed_mps_ = 0;
     paused_ = false;
     estop_ = false;
     status_ = TrajStatus::IDLE;
+    unlock();
 }
 
 void TrajectoryGen::pause() {
+    lock();
     paused_ = true;
     status_ = TrajStatus::PAUSED;
+    unlock();
 }
 
 void TrajectoryGen::resume() {
+    lock();
     paused_ = false;
     if (active_index_ >= 0 && active_index_ < (int)waypoints_.size())
         status_ = TrajStatus::ACTIVE;
     else
         status_ = TrajStatus::IDLE;
+    unlock();
 }
 
 void TrajectoryGen::emergencyStop() {
+    lock();
     estop_ = true;
     status_ = TrajStatus::ESTOP;
     current_speed_mps_ = 0;
+    unlock();
 }
 
 void TrajectoryGen::clearEstop() {
+    lock();
     estop_ = false;
     status_ = active_index_ >= 0 ? TrajStatus::ACTIVE : TrajStatus::IDLE;
+    unlock();
+}
+
+TrajStatus TrajectoryGen::status() const {
+    lock();
+    TrajStatus s = status_;
+    unlock();
+    return s;
+}
+
+const char* TrajectoryGen::orderStateString() const {
+    lock();
+    TrajStatus s = status_;
+    unlock();
+
+    switch (s) {
+    case TrajStatus::IDLE:     return "IDLE";
+    case TrajStatus::ACTIVE:   return "ACTIVE";
+    case TrajStatus::PAUSED:   return "PAUSED";
+    case TrajStatus::COMPLETE: return "COMPLETED";
+    case TrajStatus::ESTOP:    return "ESTOP";
+    default:                   return "IDLE";
+    }
+}
+
+float TrajectoryGen::currentSpeedMps() const {
+    lock();
+    float spd = current_speed_mps_;
+    unlock();
+    return spd;
+}
+
+int TrajectoryGen::activeIndex() const {
+    lock();
+    int idx = active_index_;
+    unlock();
+    return idx;
 }
 
 float TrajectoryGen::computeProfileSpeed(float dist_remaining, float max_speed,
@@ -80,20 +160,24 @@ float TrajectoryGen::computeProfileSpeed(float dist_remaining, float max_speed,
 }
 
 BodyVelocity TrajectoryGen::tick(const float pose[3], float dt_s) {
+    lock();
     BodyVelocity result = {0, 0};
 
     /* ---- Guard checks ---- */
     if (estop_) {
         current_speed_mps_ = 0;
+        unlock();
         return result; /* zero velocity = safe stop */
     }
     if (paused_ || status_ == TrajStatus::IDLE || status_ == TrajStatus::COMPLETE || active_index_ < 0) {
         current_speed_mps_ = 0;
+        unlock();
         return result;
     }
     if (active_index_ >= (int)waypoints_.size()) {
         status_ = TrajStatus::COMPLETE;
         current_speed_mps_ = 0;
+        unlock();
         return result;
     }
 
@@ -123,9 +207,11 @@ BodyVelocity TrajectoryGen::tick(const float pose[3], float dt_s) {
         if (active_index_ >= (int)waypoints_.size()) {
             status_ = TrajStatus::COMPLETE;
             current_speed_mps_ = 0;
+            unlock();
             return result;
         }
         /* Start next segment immediately on same tick */
+        unlock();
         return tick(pose, 0.0f);
     }
 
@@ -133,5 +219,7 @@ BodyVelocity TrajectoryGen::tick(const float pose[3], float dt_s) {
     result.vx_mps = speed;
     result.omega_radps = profile_.steering_gain * heading_error;
 
+    unlock();
     return result;
 }
+

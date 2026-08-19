@@ -311,3 +311,42 @@ TEST_CASE_METHOD(TestFixture, "Output is zero in every non-active state", "[traj
     REQUIRE(out.vx_mps == Approx(0.0f));
     REQUIRE(out.omega_radps == Approx(0.0f));
 }
+
+TEST_CASE_METHOD(TestFixture, "orderStateString matches server wire contract throughout lifecycle", "[trajectory][state][protocol]") {
+    // 1. Fresh -> IDLE
+    REQUIRE(std::string(gen.orderStateString()) == "IDLE");
+
+    // 2. Load waypoints -> ACTIVE
+    loadSingle(5.0f, 0.0f);
+    REQUIRE(std::string(gen.orderStateString()) == "ACTIVE");
+
+    // 3. Pause -> PAUSED
+    gen.pause();
+    REQUIRE(std::string(gen.orderStateString()) == "PAUSED");
+
+    // 4. Resume -> ACTIVE
+    gen.resume();
+    REQUIRE(std::string(gen.orderStateString()) == "ACTIVE");
+
+    // 5. Emergency Stop -> ESTOP
+    gen.emergencyStop();
+    REQUIRE(std::string(gen.orderStateString()) == "ESTOP");
+
+    // 6. Clear Estop -> ACTIVE
+    gen.clearEstop();
+    REQUIRE(std::string(gen.orderStateString()) == "ACTIVE");
+
+    // 7. Drive to completion -> COMPLETED
+    float p[3] = {0, 0, 0};
+    for (int i = 0; i < 5000 && gen.status() != TrajStatus::COMPLETE; ++i) {
+        auto out = gen.tick(p, 0.02f);
+        integrate(p, out, 0.02f);
+    }
+    REQUIRE(gen.status() == TrajStatus::COMPLETE);
+    REQUIRE(std::string(gen.orderStateString()) == "COMPLETED");
+
+    // 8. Reset -> IDLE
+    gen.reset();
+    REQUIRE(std::string(gen.orderStateString()) == "IDLE");
+}
+
