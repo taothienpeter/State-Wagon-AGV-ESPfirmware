@@ -31,6 +31,9 @@ void ES_EKF::init(float delta_t, float init_x, float init_y, float init_theta) {
 
 // --------- B1: PREDICT ---------
 void ES_EKF::predict(float delta_x, float delta_y, float delta_theta, float dt_step) {
+    if (!isfinite(delta_x) || !isfinite(delta_y) || !isfinite(delta_theta)) {
+        return;
+    }
     float cur_dt = (dt_step > 0.0001f) ? dt_step : this->dt;
     delta_theta = normalizeAngle(delta_theta);
 
@@ -65,6 +68,8 @@ void ES_EKF::predict(float delta_x, float delta_y, float delta_theta, float dt_s
 
 // --------- B2 & B3: UPDATE CHỈ VỚI IMU ---------
 void ES_EKF::updateIMU(float imu_theta) {
+    if (!isfinite(imu_theta)) return;
+
     // Không có UWB: Chỉ cập nhật Theta (từ IMU)
     // H = [0, 0, 1, 0, 0, 0]
     
@@ -74,6 +79,7 @@ void ES_EKF::updateIMU(float imu_theta) {
 
     // S = H * P * H^T + R -> Rút gọn: S = P[2][2] + R
     float S = P[2][2] + R_imu;
+    if (fabsf(S) < 1e-6f) return;
     
     // K = P * H^T / S -> Rút gọn: K là cột 2 của P chia cho S
     float K[6];
@@ -120,6 +126,7 @@ void ES_EKF::updateIMU(float imu_theta) {
 
 // --------- B2 & B3: UPDATE VỚI UWB VÀ IMU ---------
 void ES_EKF::updateUWB(float uwb_x, float uwb_y, float uwb_theta) {
+    if (!isfinite(uwb_x) || !isfinite(uwb_y) || !isfinite(uwb_theta)) return;
     // H = [I(3x3), zeros(3x3)]
     float y_tilde[3];
     y_tilde[0] = uwb_x - x_nom[0];

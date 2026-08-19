@@ -145,7 +145,8 @@ float TrajectoryGen::computeProfileSpeed(float dist_remaining, float max_speed,
 
     if (dist_remaining <= d_stop) {
         /* DECELERATE */
-        float speed = sqrtf(2.0f * profile_.max_decel_mps2 * dist_remaining);
+        float safe_dist = fmaxf(0.0f, dist_remaining);
+        float speed = sqrtf(2.0f * profile_.max_decel_mps2 * safe_dist);
         return (speed < 0) ? 0 : speed;
     } else if (current_speed < max_speed) {
         /* ACCELERATE */
