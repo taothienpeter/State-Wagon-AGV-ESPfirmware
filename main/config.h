@@ -9,9 +9,9 @@ extern "C" {
 
 /* ---- Identity & Network ---- */
 #define AGV_DEFAULT_VEHICLE_ID      "agv-test-01"
-#define AGV_DEFAULT_WIFI_SSID       "Wifi_Nha_Ban"
-#define AGV_DEFAULT_WIFI_PASS       "Mat_Khau_Wifi"
-#define AGV_DEFAULT_SERVER_HOST     "192.168.1.100"
+#define AGV_DEFAULT_WIFI_SSID       "POCO"
+#define AGV_DEFAULT_WIFI_PASS       "thientao"
+#define AGV_DEFAULT_SERVER_HOST     "10.89.31.24"
 #define AGV_DEFAULT_SERVER_PORT     7800
 
 /* ---- Timing ---- */
@@ -29,9 +29,10 @@ extern "C" {
 #define STM_CMD_RATE_HZ             50
 #define STM_FB_TIMEOUT_MS           300
 
-/* ---- Sensor Enable Flags ---- */
+/* ---- Sensor & Simulation Flags ---- */
 #define AGV_ENABLE_IMU              1   /* 1 = BNO055 active (Yaw/Heading source) */
 #define AGV_ENABLE_UWB              0   /* 0 = UWB disabled/bypassed */
+#define AGV_SIMULATE_DRIVE_FEEDBACK 1   /* 1 = Simulate wheel movement when STM32 is offline (Bench test) */
 
 /* ---- IMU (BNO055 via I2C) ---- */
 #define IMU_I2C_NUM                 I2C_NUM_0

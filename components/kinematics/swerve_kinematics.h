@@ -23,8 +23,9 @@ struct VehicleGeometry {
 };
 
 struct BodyVelocity {
-    float vx_mps;
-    float omega_radps;
+    float vx_mps = 0.0f;
+    float vy_mps = 0.0f;
+    float omega_radps = 0.0f;
 };
 
 class SwerveKinematics {
@@ -39,13 +40,14 @@ public:
     const VehicleGeometry& geometry() const { return geom_; }
 
     /* Body velocity → per-wheel commands (index 0=front, 1=rear).
-       Returns false if both vx and omega are effectively zero (idle). */
+       Returns false if vx, vy, and omega are all effectively zero (idle). */
     bool toSwerveCommand(const BodyVelocity& cmd, float dt_s, SwerveCommand wheels[2]) {
         float half_L = geom_.wheelbase_m * 0.5f;
         float vx = cmd.vx_mps;
+        float vy = cmd.vy_mps;
         float omega = cmd.omega_radps;
 
-        if (fabsf(vx) < SWERVE_EPSILON && fabsf(omega) < SWERVE_EPSILON) {
+        if (fabsf(vx) < SWERVE_EPSILON && fabsf(vy) < SWERVE_EPSILON && fabsf(omega) < SWERVE_EPSILON) {
             wheels[0] = prev_cmd_[0];
             wheels[1] = prev_cmd_[1];
             wheels[0].drive_velocity_mps = 0;
@@ -59,16 +61,16 @@ public:
 
         for (int i = 0; i < 2; i++) {
             float x_i = (i == 0) ? half_L : -half_L;
-            float v_i_y = omega * x_i;
+            float v_i_x = vx;
+            float v_i_y = vy + omega * x_i;
 
-            float angle, speed;
-            if (fabsf(vx) > SWERVE_EPSILON) {
-                angle = atan2f(v_i_y, vx);
-                speed = sqrtf(vx * vx + v_i_y * v_i_y);
+            float angle = 0.0f;
+            float speed = sqrtf(v_i_x * v_i_x + v_i_y * v_i_y);
+
+            if (speed > SWERVE_EPSILON) {
+                angle = atan2f(v_i_y, v_i_x);
             } else {
-                /* Pure rotation: wheels turn 90° opposite ways to rotate in place */
-                angle = (omega * x_i > 0.0f) ? (float)M_PI_2 : -(float)M_PI_2;
-                speed = fabsf(v_i_y);
+                angle = prev_cmd_[i].steering_angle_rad;
             }
 
             /* Apply limits */
@@ -100,35 +102,25 @@ public:
 
             prev_cmd_[i] = wheels[i];
         }
+
         return true;
     }
 
     /* Inverse: wheel feedback → body velocity estimate (for odometry/EKF) */
     BodyVelocity fromWheelFeedback(const float steering_angles[2], const float drive_speeds[2]) {
-        float half_L = geom_.wheelbase_m * 0.5f;
-        BodyVelocity result = {0, 0};
-        int count = 0;
+        BodyVelocity result = {0, 0, 0};
 
-        for (int i = 0; i < 2; i++) {
-            float angle = steering_angles[i];
-            float speed = drive_speeds[i];
-            float x_i = (i == 0) ? half_L : -half_L;
+        float v0_x = drive_speeds[0] * cosf(steering_angles[0]);
+        float v0_y = drive_speeds[0] * sinf(steering_angles[0]);
+        float v1_x = drive_speeds[1] * cosf(steering_angles[1]);
+        float v1_y = drive_speeds[1] * sinf(steering_angles[1]);
 
-            float vx_i = speed * cosf(angle);
-            float omega_i;
-            if (fabsf(x_i) > SWERVE_EPSILON)
-                omega_i = speed * sinf(angle) / x_i;
-            else
-                omega_i = 0;
-
-            result.vx_mps += vx_i;
-            result.omega_radps += omega_i;
-            count++;
-        }
-
-        if (count > 0) {
-            result.vx_mps /= count;
-            result.omega_radps /= count;
+        result.vx_mps = (v0_x + v1_x) * 0.5f;
+        result.vy_mps = (v0_y + v1_y) * 0.5f;
+        if (geom_.wheelbase_m > SWERVE_EPSILON) {
+            result.omega_radps = (v0_y - v1_y) / geom_.wheelbase_m;
+        } else {
+            result.omega_radps = 0.0f;
         }
         return result;
     }

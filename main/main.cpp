@@ -42,9 +42,10 @@ static ES_EKF         g_ekf;
 static portMUX_TYPE   ekf_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static volatile float g_pose_x = 0, g_pose_y = 0, g_pose_theta = 0;
-static volatile float g_pose_vx = 0, g_pose_omega = 0;
+static volatile float g_pose_vx = 0, g_pose_vy = 0, g_pose_omega = 0;
 static volatile float g_imu_heading = 0;
 static volatile bool  g_imu_updated = false;
+static volatile bool  g_imu_detected = false;
 static volatile float g_uwb_x = 0, g_uwb_y = 0;
 static volatile bool  g_uwb_updated = false;
 
@@ -91,6 +92,7 @@ static void plannerTaskFunc(void* arg) {
         motion_fb_t fb;
         float delta_x = 0, delta_y = 0, delta_theta = 0;
         bool has_fb = g_stm_link.getLatestFeedback(fb, 300);
+        static float sim_vx = 0.0f, sim_vy = 0.0f, sim_omega = 0.0f;
         if (has_fb) {
             /* Bicycle-model odometry: front wheel steers, rear wheel fixed (0 rad).
                Produces correct angular velocity omega = v * sin(steer) / L. */
@@ -100,10 +102,20 @@ static void plannerTaskFunc(void* arg) {
             float speeds[2] = {v_drive, v_drive};
             BodyVelocity odom = g_kinematics.fromWheelFeedback(angles, speeds);
 
-            delta_x = odom.vx_mps * cosf(g_ekf.x_nom[2]) * dt_s;
-            delta_y = odom.vx_mps * sinf(g_ekf.x_nom[2]) * dt_s;
+            float cur_th = g_ekf.x_nom[2];
+            delta_x = (odom.vx_mps * cosf(cur_th) - odom.vy_mps * sinf(cur_th)) * dt_s;
+            delta_y = (odom.vx_mps * sinf(cur_th) + odom.vy_mps * cosf(cur_th)) * dt_s;
             delta_theta = odom.omega_radps * dt_s;
         }
+#if AGV_SIMULATE_DRIVE_FEEDBACK
+        else if (g_trajectory.status() == TrajStatus::ACTIVE) {
+            /* Bench-simulation mode: simulate kinematic movement from controller velocity */
+            float current_theta = g_ekf.x_nom[2];
+            delta_x = (sim_vx * cosf(current_theta) - sim_vy * sinf(current_theta)) * dt_s;
+            delta_y = (sim_vx * sinf(current_theta) + sim_vy * cosf(current_theta)) * dt_s;
+            delta_theta = sim_omega * dt_s;
+        }
+#endif
 
         /* 2. EKF predict (wheel odometry + dynamic dt_s) */
         g_ekf.predict(delta_x, delta_y, delta_theta, dt_s);
@@ -138,12 +150,18 @@ static void plannerTaskFunc(void* arg) {
         g_pose_y = g_ekf.x_nom[1];
         g_pose_theta = g_ekf.x_nom[2];
         g_pose_vx = g_ekf.x_nom[3];
+        g_pose_vy = g_ekf.x_nom[4];
         g_pose_omega = g_ekf.x_nom[5];
         portEXIT_CRITICAL(&ekf_mux);
 
         /* ---- Trajectory generation → BodyVelocity ---- */
         float pose[3] = {g_pose_x, g_pose_y, g_pose_theta};
         BodyVelocity body_v = g_trajectory.tick(pose, dt_s);
+#if AGV_SIMULATE_DRIVE_FEEDBACK
+        sim_vx = body_v.vx_mps;
+        sim_vy = body_v.vy_mps;
+        sim_omega = body_v.omega_radps;
+#endif
 
         /* ---- BodyVelocity → Swerve kinematics → wheel commands ---- */
         SwerveCommand wheels[2];
@@ -195,9 +213,13 @@ static void imuTaskFunc(void* arg) {
     Bno055Driver imu(IMU_I2C_NUM, IMU_I2C_SDA_PIN, IMU_I2C_SCL_PIN,
                      IMU_I2C_CLOCK_HZ, IMU_I2C_ADDR);
 
-    if (!imu.begin()) {
+    bool init_ok = imu.begin();
+    if (!init_ok) {
         ESP_LOGE(TAG, "BNO055 init failed — EKF uses odometry only");
     }
+    portENTER_CRITICAL(&ekf_mux);
+    g_imu_detected = init_ok;
+    portEXIT_CRITICAL(&ekf_mux);
 
     TickType_t last_wake = xTaskGetTickCount();
     const TickType_t period = pdMS_TO_TICKS(1000 / IMU_SAMPLE_RATE_HZ);
@@ -210,6 +232,7 @@ static void imuTaskFunc(void* arg) {
             portENTER_CRITICAL(&ekf_mux);
             g_imu_heading = heading_rad;
             g_imu_updated = true;
+            g_imu_detected = true;
             portEXIT_CRITICAL(&ekf_mux);
         }
     }
@@ -278,8 +301,9 @@ static void statePublishTaskFunc(void* arg) {
         /* Read shared EKF pose */
         portENTER_CRITICAL(&ekf_mux);
         float px = g_pose_x, py = g_pose_y, pt = g_pose_theta;
-        float vx = g_pose_vx, omega = g_pose_omega;
+        float vx = g_pose_vx, vy = g_pose_vy, omega = g_pose_omega;
         float imu_h = g_imu_heading;
+        bool imu_det = g_imu_detected;
 #if AGV_ENABLE_UWB
         float uwb_x = g_uwb_x, uwb_y = g_uwb_y;
 #endif
@@ -304,11 +328,18 @@ static void statePublishTaskFunc(void* arg) {
         const char* safety_state_str = "NORMAL";
         if (ts == TrajStatus::ESTOP) {
             safety_state_str = "SAFE_STOP";
-        } else {
-            uint8_t safety_state = fb_valid ? fb.safety_state : 2; /* SAFE_STOP if no FB */
+        } else if (fb_valid) {
+            uint8_t safety_state = fb.safety_state;
             safety_state_str = (safety_state == 0) ? "NORMAL" :
                                (safety_state == 1) ? "WARN" :
                                (safety_state == 2) ? "SAFE_STOP" : "FAULT_LATCHED";
+        } else {
+            /* [TEMPORARY BENCH TEST FLAG - FLAG-01]:
+             * Relaxed to "NORMAL" for standalone ESP32 development/testing without STM32 UART link.
+             * FOR FULL SYSTEM INTEGRATION: In production with STM32 connected, loss of UART link (>500ms)
+             * should latch "SAFE_STOP" to prevent autonomous driving when drive controller feedback is lost.
+             * (See doc/BUGS.md & doc/ARCHITECTUREv3.md for integration checklist). */
+            safety_state_str = "NORMAL";
         }
 
         /* Build state JSON payload (zero-malloc) */
@@ -324,9 +355,15 @@ static void statePublishTaskFunc(void* arg) {
         pos["y"] = py;
         pos["theta"] = pt;
 
+        // Convert EKF world frame velocities to Robot Body Frame for standard telemetry:
+        float cos_t = cosf(pt);
+        float sin_t = sinf(pt);
+        float body_vx =  vx * cos_t + vy * sin_t;
+        float body_vy = -vx * sin_t + vy * cos_t;
+
         JsonObject vel = doc.createNestedObject("velocity");
-        vel["vx"] = vx;
-        vel["vy"] = 0.0f;
+        vel["vx"] = body_vx;
+        vel["vy"] = body_vy;
         vel["omega"] = omega;
 
         JsonObject bat = doc.createNestedObject("battery");
@@ -344,7 +381,8 @@ static void statePublishTaskFunc(void* arg) {
         gyro.add(0.0f);
         gyro.add(0.0f);
         imu_obj["heading_rad"] = imu_h;
-        imu_obj["calibration_status"] = 3; /* placeholder — read full cal status */
+        imu_obj["detected"] = imu_det;
+        imu_obj["calibration_status"] = imu_det ? 3 : 0;
 
         JsonObject uwb_obj = doc.createNestedObject("uwb");
 #if AGV_ENABLE_UWB
@@ -363,12 +401,24 @@ static void statePublishTaskFunc(void* arg) {
         JsonObject ctrl = controllers.createNestedObject();
         ctrl["id"] = "stm32-main";
         ctrl["linkOk"] = link_ok;
+        ctrl["simulated"] = (AGV_SIMULATE_DRIVE_FEEDBACK && !fb_valid);
         ctrl["faultCode"] = fb_valid ? fb.fault_code : 0;
         ctrl["odriveVbus"] = fb_valid ? fb.odrive_vbus_v : 0.0f;
         ctrl["odriveErrors"] = fb_valid ? fb.odrive_error_flags : 0;
         ctrl["stepperHomed"] = fb_valid ? fb.stepper_homed : 0;
 
-        doc.createNestedArray("errors");
+        JsonArray errors = doc.createNestedArray("errors");
+#if AGV_ENABLE_IMU
+        if (!imu_det) {
+            errors.add("IMU_NOT_DETECTED");
+        }
+#endif
+        if (!link_ok) {
+            errors.add("STM32_DISCONNECTED");
+        }
+        if (fb_valid && fb.odrive_error_flags != 0) {
+            errors.add("ODRIVE_AXIS_ERROR");
+        }
 
         size_t len = serializeJson(doc, json_buf, sizeof(json_buf));
         if (len > 0 && len < sizeof(json_buf)) {
@@ -424,8 +474,22 @@ static void onOrderReceived(const char* order_id, const char* waypoints_json) {
         Waypoint w;
         w.x = wp["x"] | 0.0f;
         w.y = wp["y"] | 0.0f;
+        if (wp.containsKey("theta")) {
+            w.theta_rad = wp["theta"].as<float>();
+            w.has_theta = true;
+        } else if (wp.containsKey("theta_rad")) {
+            w.theta_rad = wp["theta_rad"].as<float>();
+            w.has_theta = true;
+        } else if (wp.containsKey("heading_deg")) {
+            w.theta_rad = wp["heading_deg"].as<float>() * (float)M_PI / 180.0f;
+            w.has_theta = true;
+        } else {
+            w.has_theta = false;
+        }
         w.max_speed_mps = wp["max_speed_mps"] | 1.0f;
+        w.max_omega_radps = wp["max_omega_radps"] | 2.0f;
         w.tolerance_m = wp["tolerance_m"] | 0.05f;
+        w.tolerance_theta_rad = wp["tolerance_theta_rad"] | 0.08f;
         wps.push_back(w);
     }
 
@@ -459,6 +523,11 @@ static void onInstantAction(const char* action_type) {
         g_trajectory.resume();
     } else if (strcmp(action_type, "clearFault") == 0) {
         g_trajectory.clearEstop();
+        /* Send IDLE command to STM32 to clear latched safe stop */
+        motion_cmd_t cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.mode = MODE_IDLE;
+        g_stm_link.sendMotionCmd(cmd);
     }
 }
 
@@ -507,6 +576,7 @@ static void wifi_init_sta(void) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
     ESP_LOGI(TAG, "Connecting to WiFi: %s", AGV_DEFAULT_WIFI_SSID);
 

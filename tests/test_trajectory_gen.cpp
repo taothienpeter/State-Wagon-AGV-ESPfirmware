@@ -12,7 +12,12 @@ struct TestFixture {
     TrajectoryGen gen{profile};
 
     static Waypoint wp(float x, float y, float max_speed = 1.0f, float tolerance = 0.05f) {
-        return Waypoint{x, y, max_speed, tolerance};
+        Waypoint w;
+        w.x = x;
+        w.y = y;
+        w.max_speed_mps = max_speed;
+        w.tolerance_m = tolerance;
+        return w;
     }
 
     TrajectoryGen& loadSingle(float x, float y, float max_speed = 1.0f) {
@@ -30,8 +35,10 @@ struct TestFixture {
     }
 
     static void integrate(float p[3], const BodyVelocity& v, float dt) {
-        p[0] += v.vx_mps * std::cos(p[2]) * dt;
-        p[1] += v.vx_mps * std::sin(p[2]) * dt;
+        float cos_t = std::cos(p[2]);
+        float sin_t = std::sin(p[2]);
+        p[0] += (v.vx_mps * cos_t - v.vy_mps * sin_t) * dt;
+        p[1] += (v.vx_mps * sin_t + v.vy_mps * cos_t) * dt;
         p[2] += v.omega_radps * dt;
     }
 };

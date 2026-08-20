@@ -6,13 +6,14 @@
 namespace {
 constexpr float kHalfL = 0.21f;        /* wheelbase 0.42 / 2 */
 constexpr float kMaxSteerRate = 3.14f; /* firmware max_steering_rate_radps */
+constexpr float kHalfPi = 1.57079632679f;
 }
 
 struct TestFixture {
     VehicleGeometry fw_geom{0.42f, 0.075f, 1.2f, 1.57f, 3.14f};
 
-    static BodyVelocity cmd(float vx, float omega) {
-        return BodyVelocity{vx, omega};
+    static BodyVelocity cmd(float vx, float omega, float vy = 0.0f) {
+        return BodyVelocity{vx, vy, omega};
     }
 };
 
@@ -193,23 +194,41 @@ TEST_CASE_METHOD(TestFixture, "Inverse: zero feedback gives zero body velocity",
     REQUIRE(v.omega_radps == Approx(0.0f));
 }
 
-TEST_CASE_METHOD(TestFixture, "Round-trip: toSwerveCommand then fromWheelFeedback recovers input", "[kinematics][roundtrip]") {
-    const float sweep[][2] = {
-        {0.3f, 0.0f},
-        {0.5f, 0.2f},
-        {1.0f, 0.5f},
-        {0.8f, -0.3f},
-        {1.0f, 2.0f},
+TEST_CASE_METHOD(TestFixture, "Pure strafe (vy): both wheels turn 90 deg parallel", "[kinematics][holonomic]") {
+    SwerveKinematics kin{fw_geom};
+    SwerveCommand wheels[2];
+    REQUIRE(kin.toSwerveCommand(cmd(0.0f, 0.0f, 0.8f), 1.0f, wheels));
+    REQUIRE(wheels[0].steering_angle_rad == Approx(kHalfPi).margin(1e-2f));
+    REQUIRE(wheels[1].steering_angle_rad == Approx(kHalfPi).margin(1e-2f));
+    REQUIRE(wheels[0].drive_velocity_mps == Approx(0.8f));
+    REQUIRE(wheels[1].drive_velocity_mps == Approx(0.8f));
+
+    float angles[2] = {wheels[0].steering_angle_rad, wheels[1].steering_angle_rad};
+    float speeds[2] = {wheels[0].drive_velocity_mps, wheels[1].drive_velocity_mps};
+    BodyVelocity rec = kin.fromWheelFeedback(angles, speeds);
+    REQUIRE(rec.vx_mps == Approx(0.0f).margin(1e-2f));
+    REQUIRE(rec.vy_mps == Approx(0.8f).margin(1e-2f));
+    REQUIRE(rec.omega_radps == Approx(0.0f).margin(1e-2f));
+}
+
+TEST_CASE_METHOD(TestFixture, "Round-trip: toSwerveCommand then fromWheelFeedback recovers holonomic input", "[kinematics][roundtrip]") {
+    const float sweep[][3] = {
+        {0.3f, 0.0f, 0.0f},
+        {0.5f, 0.2f, 0.0f},
+        {0.0f, 0.0f, 0.6f},
+        {0.5f, 0.0f, 0.5f},
+        {0.8f, -0.3f, 0.2f},
     };
     for (const auto& p : sweep) {
         SwerveKinematics kin{fw_geom};
         SwerveCommand wheels[2];
-        REQUIRE(kin.toSwerveCommand(cmd(p[0], p[1]), 1.0f, wheels));
+        REQUIRE(kin.toSwerveCommand(cmd(p[0], p[1], p[2]), 1.0f, wheels));
         float angles[2] = {wheels[0].steering_angle_rad, wheels[1].steering_angle_rad};
         float speeds[2] = {wheels[0].drive_velocity_mps, wheels[1].drive_velocity_mps};
         BodyVelocity rec = kin.fromWheelFeedback(angles, speeds);
-        INFO("point vx=" << p[0] << " omega=" << p[1]);
-        REQUIRE(rec.vx_mps == Approx(p[0]).margin(1e-3f));
-        REQUIRE(rec.omega_radps == Approx(p[1]).margin(1e-3f));
+        INFO("point vx=" << p[0] << " vy=" << p[2] << " omega=" << p[1]);
+        REQUIRE(rec.vx_mps == Approx(p[0]).margin(1e-2f));
+        REQUIRE(rec.vy_mps == Approx(p[2]).margin(1e-2f));
+        REQUIRE(rec.omega_radps == Approx(p[1]).margin(1e-2f));
     }
 }

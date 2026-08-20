@@ -93,11 +93,22 @@ bool Hop1Client::connectOnce() {
         return false;
     }
 
-    struct timeval timeout = {5, 0};
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    /* Enable TCP Keep-Alive to detect real connection drops without spurious timeouts */
+    int keepalive = 1;
+    int keepidle = 5;
+    int keepinterval = 2;
+    int keepcount = 3;
+    setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &keepinterval, sizeof(keepinterval));
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &keepcount, sizeof(keepcount));
 
+    struct timeval send_timeout = {5, 0};
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
+
+    ESP_LOGI(TAG, "Connecting to server %s:%u...", host_, port_);
     if (connect(s, res->ai_addr, res->ai_addrlen) < 0) {
+        ESP_LOGW(TAG, "connect to %s:%u failed: errno %d", host_, port_, errno);
         close(s);
         freeaddrinfo(res);
         return false;
@@ -122,7 +133,10 @@ void Hop1Client::handleIncomingLoop(int sock) {
         uint8_t len_buf[4];
         int r = recv(sock, (char*)len_buf, 4, MSG_WAITALL);
         if (r <= 0) {
-            ESP_LOGW(TAG, "Connection lost (length prefix)");
+            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+                continue;
+            }
+            ESP_LOGW(TAG, "Connection lost (length prefix, r=%d, errno=%d)", r, errno);
             return;
         }
         uint32_t msg_len = (uint32_t)len_buf[0] << 24
@@ -137,7 +151,10 @@ void Hop1Client::handleIncomingLoop(int sock) {
         /* Read JSON payload */
         r = recv(sock, (char*)recv_buf_, msg_len, MSG_WAITALL);
         if (r <= 0) {
-            ESP_LOGW(TAG, "Connection lost (payload)");
+            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+                continue;
+            }
+            ESP_LOGW(TAG, "Connection lost (payload, r=%d, errno=%d)", r, errno);
             return;
         }
         recv_buf_[msg_len] = 0;
@@ -183,9 +200,9 @@ void Hop1Client::sendEnvelope(int sock, const char* type, const char* payload) {
 
     if (send_mux_) xSemaphoreTake(send_mux_, portMAX_DELAY);
 
-    static StaticJsonDocument<2048> doc;
-    static StaticJsonDocument<1024> payload_doc;
-    static char buf[2048];
+    static StaticJsonDocument<4096> doc;
+    static StaticJsonDocument<3072> payload_doc;
+    static char buf[4096];
 
     doc.clear();
     doc["type"] = type;

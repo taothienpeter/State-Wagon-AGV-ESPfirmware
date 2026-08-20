@@ -982,14 +982,27 @@ these have not been implemented yet.
 
 ---
 
-## 9. PROTOCOL VERIFICATION
-
-Before first autonomous run:
-1. Compile-time check: if `_Static_assert` fails for any struct size, the build
-   fails. Verify all four assert statements in `stm_link.h` pass.
-2. Monitor planner task watermark — should stay above 1024 bytes.
-3. Verify `dt_s` reported in logs stays within 18–22 ms at 50 Hz.
-4. Confirm STM32 watchdog timer does not expire during normal operation
-   (CMD_TIMEOUT = 150 ms, planner rate = 50 Hz → 3 missed frames tolerated).
-5. Verify `sizeof(motion_cmd_t) == 20` and `sizeof(motion_fb_t) == 29` match
-   on both ESP32 and STM32 compilers.
+994: 5. Verify `sizeof(motion_cmd_t) == 20` and `sizeof(motion_fb_t) == 29` match
+995:    on both ESP32 and STM32 compilers.
+996: 
+997: ---
+998: 
+999: ## 10. FULL SYSTEM INTEGRATION CHECKLIST & BENCH-TEST FLAGS
+1000: 
+1001: When moving from standalone bench testing to full vehicle integration (ESP32 + STM32 + ODrive + BNO055 + DWM1000), review and configure the following flags:
+1002: 
+1003: 1. **`FLAG-01`: STM32 UART Feedback Safety Guard (`main/main.cpp:307`)**
+1004:    - *Bench-test mode (Current)*: `safetyState` defaults to `"NORMAL"` when `fb_valid == false` to allow standalone UI and trajectory testing without STM32 UART transceiver.
+1005:    - *Full System Integration*: Restore `safety_state = fb_valid ? fb.safety_state : 2` (`SAFE_STOP`). Any loss of UART communications (>500ms) will immediately trigger safe stop.
+1006: 
+1007: 2. **`FLAG-02`: UWB 3-Source Sensor Fusion (`main/config.h:33`)**
+1008:    - *Bench-test mode (Current)*: `#define AGV_ENABLE_UWB 0` (EKF runs on Wheel Odometry + BNO055 IMU Yaw).
+1009:    - *Full System Integration*: Set `#define AGV_ENABLE_UWB 1`, set anchor count `#define UWB_ANCHOR_COUNT 4`, and measure real anchor positions `(x, y, z)` in `main/main.cpp:230-235`.
+1010: 
+1011: 3. **`FLAG-03`: Permanent Bug Fixes Retained**
+1012:    - TCP Socket Keep-Alive (replaces `SO_RCVTIMEO` disconnect trap `BUG-16`).
+1013:    - WiFi Modem Sleep Disabled (`WIFI_PS_NONE` in `main.cpp:512` - `BUG-17`).
+1014:    - Zero-malloc JSON serialization across all cyclic tasks (`BUG-11`, `BUG-14`).
+1015:    - Dedicated FreeRTOS Queue for STM32 safety events (`BUG-01`).
+1016:    - FreeRTOS Recursive Mutex on `TrajectoryGen` (`BUG-10`).
+1017: 

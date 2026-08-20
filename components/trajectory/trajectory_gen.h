@@ -13,15 +13,21 @@
 #ifdef __cplusplus
 
 struct Waypoint {
-    float x, y;
+    float x = 0.0f;
+    float y = 0.0f;
+    float theta_rad = 0.0f;
+    bool has_theta = false;
     float max_speed_mps = 1.0f;
+    float max_omega_radps = 2.0f;
     float tolerance_m = 0.05f;
+    float tolerance_theta_rad = 0.08f;
 };
 
 struct MotionProfile {
     float max_accel_mps2 = 0.5f;
     float max_decel_mps2 = 0.8f;
-    float steering_gain = 1.0f;
+    float steering_gain = 1.5f;
+    float max_angular_accel_radps2 = 2.0f;
 };
 
 enum class TrajStatus : uint8_t {

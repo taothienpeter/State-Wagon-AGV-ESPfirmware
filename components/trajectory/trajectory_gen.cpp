@@ -184,26 +184,33 @@ BodyVelocity TrajectoryGen::tick(const float pose[3], float dt_s) {
 
     const Waypoint& wp = waypoints_[active_index_];
 
-    /* ---- Compute position error ---- */
+    /* ---- 1. World Frame Position Error ---- */
     float dx = wp.x - pose[0];
     float dy = wp.y - pose[1];
     float dist = sqrtf(dx * dx + dy * dy);
 
-    /* ---- Compute heading error ---- */
-    float target_heading = atan2f(dy, dx);
-    float heading_error = normalizeAngle(target_heading - pose[2]);
-    if (heading_error > PI_OVER_3)
-        heading_error = PI_OVER_3;
-    else if (heading_error < -PI_OVER_3)
-        heading_error = -PI_OVER_3;
+    /* ---- 2. Chassis Heading Error (Independent of Motion Vector) ---- */
+    float heading_error = 0.0f;
+    if (wp.has_theta) {
+        heading_error = normalizeAngle(wp.theta_rad - pose[2]);
+    } else {
+        /* When no target theta is specified, hold current chassis heading (swerve strafe) */
+        heading_error = 0.0f;
+    }
 
-    /* ---- Speed profile (trapezoidal) ---- */
+    /* ---- 3. Linear Speed Profile (Trapezoidal along path vector) ---- */
     float speed = computeProfileSpeed(dist, wp.max_speed_mps,
                                        current_speed_mps_, dt_s);
     current_speed_mps_ = speed;
 
-    /* ---- Arrival detection ---- */
-    if (dist < wp.tolerance_m) {
+    /* ---- 4. Arrival Detection (Position AND Chassis Heading) ---- */
+    bool is_last_wp = (active_index_ == (int)waypoints_.size() - 1);
+    float effective_tol = is_last_wp ? wp.tolerance_m : fmaxf(wp.tolerance_m, 0.15f);
+
+    bool pos_arrived = (dist < effective_tol);
+    bool heading_arrived = (!wp.has_theta || fabsf(heading_error) < wp.tolerance_theta_rad);
+
+    if (pos_arrived && heading_arrived) {
         active_index_++;
         if (active_index_ >= (int)waypoints_.size()) {
             status_ = TrajStatus::COMPLETE;
@@ -216,9 +223,35 @@ BodyVelocity TrajectoryGen::tick(const float pose[3], float dt_s) {
         return tick(pose, 0.0f);
     }
 
-    /* ---- Build BodyVelocity ---- */
-    result.vx_mps = speed;
-    result.omega_radps = profile_.steering_gain * heading_error;
+    /* ---- 5. Holonomic Swerve Drive Velocity Computation ---- */
+    // World Frame Linear Velocity Vector (directed from current pos to waypoint):
+    float vw_x = 0.0f;
+    float vw_y = 0.0f;
+    if (dist > 0.001f) {
+        vw_x = speed * (dx / dist);
+        vw_y = speed * (dy / dist);
+    }
+
+    // Transform World Velocity Vector to Robot Chassis Body Frame:
+    // vx_body =  vw_x * cos(theta) + vw_y * sin(theta)
+    // vy_body = -vw_x * sin(theta) + vw_y * cos(theta)
+    float current_theta = pose[2];
+    float cos_t = cosf(current_theta);
+    float sin_t = sinf(current_theta);
+
+    result.vx_mps =  vw_x * cos_t + vw_y * sin_t;
+    result.vy_mps = -vw_x * sin_t + vw_y * cos_t;
+
+    // Independent Chassis Rotational Velocity (Omega):
+    if (wp.has_theta) {
+        float max_w = (wp.max_omega_radps > 0.1f) ? wp.max_omega_radps : 2.0f;
+        float omega_cmd = profile_.steering_gain * 2.0f * heading_error;
+        if (omega_cmd > max_w) omega_cmd = max_w;
+        else if (omega_cmd < -max_w) omega_cmd = -max_w;
+        result.omega_radps = omega_cmd;
+    } else {
+        result.omega_radps = 0.0f;
+    }
 
     unlock();
     return result;
